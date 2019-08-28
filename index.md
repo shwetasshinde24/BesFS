@@ -38,3 +38,43 @@ make depend
 
 make all
 ```
+
+
+## Papers
+
+* **"BesFS: A POSIX Filesystem for Enclaves with a Mechanized Safety Proof"**, 
+_Shweta Shinde*, Shengyi Wang*, Pinghai Yuan, Aquinas Hobor, Abhik Roychoudhury, Prateek Saxena_, 
+arXiv preprint arXiv:1807.00477
+[Paper](https://arxiv.org/abs/1807.00477)
+
+-----
+
+
+## Contact 
+
+### BesFS Team 
+
+#### [Shweta Shinde](https://people.eecs.berkeley.edu/~shwetas/)
+
+#### [Shengyi Wang](https://www.comp.nus.edu.sg/~shengyi/)
+
+#### [Pinghai Yuan](https://www.comp.nus.edu.sg/~yuanping/)
+
+#### [Aquinas Hobor](https://www.comp.nus.edu.sg/~hobor/)
+
+#### [Abhik Roychoudhury](https://www.comp.nus.edu.sg/~abhik/)
+
+#### [Prateek Saxena](https://www.comp.nus.edu.sg/~prateeks/) 
+
+
+-----
+
+
+## Acknowledgements
+
+
+### National Research Foundation 
+This research was partially supported by a grant from the National Research Foundation, Prime Ministers Office, Singapore under its National Cybersecurity R&D Program (<a href="http://www.comp.nus.edu.sg/~tsunami/">TSUNAMi project, No. NRF2014NCR-NCR001-21 </a>) and administered by the National Cybersecurity R&D Directorate.
+
+### National Science Foundation 
+This material is in part based upon work supported by the National Science Foundation under Grant No. DARPA N66001-15-C-4066 and Center for Long-Term Cybersecurity. Any opinions, findings, and conclusions or recommendations ex- pressed in this material are those of the author(s) and do not necessarily reflect the views of the National Science Foundation. 
