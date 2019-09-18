@@ -15,6 +15,8 @@ Section SGX_FS.
 
   Definition Pgid : Set := nat.
 
+  Definition Memid : Set := nat.
+
   Record Permission :=
     {
       readable: bool;
@@ -79,6 +81,7 @@ Section SGX_FS.
     | String a s' => a :: string_to_byte_list s'
     end.
 
+  Check (Dnode 2 [Fnode 5 ; Fnode 6; Dnode 5 []]).
 
   Record FData :=
     {
@@ -93,6 +96,7 @@ Section SGX_FS.
       metaD : Permission;
     }.
 
+  (* Parameter oh : list Fid. *)
 
   Definition Path := list string.
 
@@ -111,7 +115,16 @@ Section SGX_FS.
   | eNoDir
   | eExists
   | eAcces
-  | eNotDir.
+  | eNotDir
+  | eMapFailed.
+
+  Inductive MmapMode :=
+  | mapAnon
+  | mapFile
+  | mapShared
+  | mapPrivate.
+
+  Definition MmapedMemory := list Page.
 
   Open Scope string_scope.
 
@@ -124,6 +137,8 @@ Section SGX_FS.
       d_map : Did -> DData;
       fnode_ctr: nat;
       dnode_ctr: nat;
+      mmap_handles : list (Memid * nat * Permission);
+      mmap_memory : MmapedMemory;
     }.
 
   Definition memory_upper_bound : nat := Z.to_nat 65536%Z.
@@ -142,7 +157,9 @@ Section SGX_FS.
   | Call_VReadDir: Path -> ErrCode -> LogCommand
   | Call_VStat: Fid -> ErrCode -> LogCommand
   | Call_VTruncate: Fid -> nat -> string -> ErrCode -> LogCommand
-  | Call_VRemove: Path -> string -> ErrCode -> LogCommand.
+  | Call_VRemove: Path -> string -> ErrCode -> LogCommand
+  | Call_AllocMem: MmapedMemory -> nat -> list Memid -> LogCommand
+  | Call_DeallocMem: MmapedMemory -> Memid -> nat -> bool -> LogCommand.
 
   Definition FSState := (FileSystem * list LogCommand)%type.
 
@@ -151,7 +168,7 @@ Section SGX_FS.
        (Fnode O) nil nil
        (fun _ => Build_FData EmptyString
                              (Build_Meta (Build_Permission false false false) O) nil)
-       (fun _ => Build_DData EmptyString (Build_Permission false false false)) O 1,
+       (fun _ => Build_DData EmptyString (Build_Permission false false false)) O 1 nil nil,
      nil).
 
   Definition mkfs (disk_name: string) : FSState :=
@@ -162,7 +179,7 @@ Section SGX_FS.
        (fun did => if Nat.eq_dec did O
                    then Build_DData disk_name (Build_Permission true true true)
                    else Build_DData EmptyString
-                                    (Build_Permission false false false)) O 1,
+                                    (Build_Permission false false false)) O 1 nil nil,
      Call_MKFS disk_name :: nil).
 
   Definition getOpenHandles: State FSState (list (Fid * nat)) :=
@@ -171,26 +188,45 @@ Section SGX_FS.
   Definition putOpenHandles: list (Fid * nat) -> State FSState unit :=
     fun oh x =>
       let (fs, logs) := x in
-      (tt, (Build_FileSystem fs.(layout) oh fs.(virtual_memory)
-            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr), logs)).
+      (tt, (Build_FileSystem
+              fs.(layout) oh fs.(virtual_memory) fs.(f_map)
+              fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr)
+              fs.(mmap_handles) fs.(mmap_memory), logs)).
 
   Definition putVirtualMemory: list Page -> State FSState unit :=
     fun vm x =>
       let (fs, logs) := x in
       (tt, (Build_FileSystem fs.(layout) fs.(open_handles) vm
-            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr), logs)).
+            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr)
+            fs.(mmap_handles) fs.(mmap_memory), logs)).
 
   Definition putFMap: (Fid -> FData) -> State FSState unit :=
     fun fmap x =>
       let (fs, logs) := x in
       (tt, (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory)
-            fmap fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr), logs)).
+            fmap fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr)
+            fs.(mmap_handles) fs.(mmap_memory), logs)).
 
   Definition putLayout: Tree -> State FSState unit :=
     fun tree x =>
       let (fs, logs) := x in
       (tt, (Build_FileSystem tree fs.(open_handles) fs.(virtual_memory)
-            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr), logs)).
+            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr)
+            fs.(mmap_handles) fs.(mmap_memory), logs)).
+
+  Definition putMmapHandles: list (Memid * nat * Permission) -> State FSState unit :=
+    fun h x =>
+      let (fs, logs) := x in
+      (tt, (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory)
+            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr)
+            h fs.(mmap_memory), logs)).
+
+  Definition putMmapMemory: MmapedMemory -> State FSState unit :=
+    fun m x =>
+      let (fs, logs) := x in
+      (tt, (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory)
+            fs.(f_map) fs.(d_map) fs.(fnode_ctr) fs.(dnode_ctr)
+            fs.(mmap_handles) m, logs)).
 
   Definition getTree: State FSState Tree := fun x => ((fst x).(layout), x).
   Definition getFS: State FSState FileSystem := fun x => (fst x, x).
@@ -206,6 +242,7 @@ Section SGX_FS.
       do ss <- get;
       return_ (length (snd ss)).
 
+  Compute (testExternalCall trivialFS).
 
   Definition psize := Z.to_nat 4000%Z.
   Definition block_size := Z.to_nat 4096%Z.
@@ -215,11 +252,11 @@ Section SGX_FS.
   Parameter v_lseek : Fid -> nat -> nat -> ErrCode.
   Parameter v_close: Fid -> nat -> ErrCode.
   Parameter v_open: Path -> string -> nat -> ErrCode.
- 
+  (* Definition v_open (a: Path) (b: string) (c: nat) := eSucc. *)
   Parameter v_create: Path -> string -> Permission -> nat -> ErrCode.
   Parameter v_chmod: Path -> Permission -> nat -> ErrCode.
   Parameter v_remove: Path -> string -> nat -> ErrCode.
-  
+  (* Definition v_create (a: Path) (b: string) (c: Permission) (d: nat) := eSucc. *)
   Parameter v_mkdir: Path -> string -> Permission -> nat -> ErrCode.
   Parameter v_rmdir: Path -> nat -> ErrCode.
   Parameter v_readdir: Path -> nat -> ErrCode.
@@ -230,6 +267,13 @@ Section SGX_FS.
   Parameter verify_page: string -> bool.
   Parameter extract_page : string -> string.
   Parameter truncate_page: string -> nat -> nat -> string.
+  Parameter allocate_memory: MmapedMemory -> nat -> nat -> list Memid.
+  Parameter deallocate_memory: MmapedMemory -> Memid -> nat -> nat -> bool.
+
+  (* TODO *)
+  (*   1. Add counter to v_func *)
+  (*   2. Record returned value in log *)
+  (*   3. Define a clearner externalCall.                                      *)
 
   Definition isNotSucc (err: ErrCode) : {err <> eSucc} + {err = eSucc}.
   Proof. destruct err; [right; auto | left; intro s; inversion s..]. Defined.
@@ -246,6 +290,8 @@ Section SGX_FS.
 
   Definition pos_to_vlen (pos: nat) (len : nat) : nat :=
     ((pos + len)/psize - (pos / psize) + 1) * block_size.
+
+  (* TODO: pos + len should <= the total size of the file, the same as seek *)
 
   Definition fs_parameter (n: nat): Type :=
     match n with
@@ -286,7 +332,7 @@ Section SGX_FS.
   Definition fs_read (arg : fs_parameter O) : State FSState (fs_result O) :=
     let (fId, len) := arg in
     do oh <- getOpenHandles;
-      let opos := find (fun x => (fst x) =? fId) oh in
+      let opos := find (fun x => Nat.eqb (fst x) fId) oh in
       match opos with
       | None => return_ ("", eBadF)
       | Some (_, pos) =>
@@ -340,6 +386,7 @@ Section SGX_FS.
   Definition sampleTree := Dnode 0 [Dnode 1 []; Dnode 2 [Dnode 4 [Fnode 4; Dnode 5 [];
   Dnode 6 []; Dnode 7 [Dnode 8 [Dnode 9 []; Fnode 1; Fnode 2; Fnode 3]]]]; Dnode 3 []].
 
+  (* Compute (findDir sampleTree [2; 4; 7; 8]). *)
 
   Fixpoint collectBareFids (li : list Tree) : list Fid :=
     match li with
@@ -376,6 +423,29 @@ Section SGX_FS.
 
   Definition isDir (t : Tree) : Prop := exists d l, t = Dnode d l.
 
+  Definition pad_size (len: nat): nat :=
+    let q := len / block_size in
+    if Nat.eq_dec (len mod block_size) O then q else S q.
+
+  Definition Disjoint (h1 h2: (Memid * nat * Permission)): Prop :=
+    match h1 with
+    | ((s1, len1), _) => match h2 with
+                         | ((s2, len2), _) => s1 + pad_size len1 <= s2 \/
+                                              s2 + pad_size len2 <= s1
+                         end
+    end.
+
+  Inductive NoOverlap: list (Memid * nat * Permission) -> Prop :=
+  | NoOverlap_nil: NoOverlap nil
+  | NoOverlap_cons: forall x l, (forall y, In y l -> Disjoint x y) ->
+                                NoOverlap l -> NoOverlap (x :: l).
+
+  Definition NotNullHandles (x: (Memid * nat * Permission)) : Prop :=
+    match x with | (_, len, _) => len <> O end.
+
+  Definition NoNull (l: list (Memid * nat * Permission)): Prop :=
+    Forall NotNullHandles l.
+
   Definition good_file_system (fs: FileSystem) : Prop :=
     NoDupNameTree fs.(f_map) fs.(d_map) fs.(layout) /\
     NoDup (collectDids fs.(layout)) /\
@@ -389,9 +459,15 @@ Section SGX_FS.
         In pgId1 (fs.(f_map) fId1).(pageIdsF) ->
         In pgId2 (fs.(f_map) fId2).(pageIdsF) -> pgId1 <> pgId2) /\
     (forall fId pgId, In pgId (fs.(f_map) fId).(pageIdsF) ->
-                      pgId < memory_upper_bound).
+                      pgId < memory_upper_bound) /\ NoOverlap (mmap_handles fs) /\
+    (forall mem, In mem (mmap_memory fs) -> length mem = block_size) /\
+    NoNull (mmap_handles fs).
 
+  Compute (collectBareFids [Dnode 9 []; Fnode 1; Fnode 2; Fnode 3]).
 
+  Compute (collectDids sampleTree).
+
+  Compute (collectFids sampleTree).
 
   Definition findFids (dmap: Did -> DData) (tree: Tree) (p: Path) : list Fid :=
     match findDir dmap tree p with
@@ -456,7 +532,7 @@ Section SGX_FS.
     - right. left. auto.
     - split.
       + constructor; auto.
-      + constructor. exists 4, [Fnode 4; Dnode 5 []; Dnode 6 []; Dnode 7 [Dnode 8 
+      + constructor. exists 4, [Fnode 4; Dnode 5 []; Dnode 6 []; Dnode 7 [Dnode 8
         [Dnode 9 []; Fnode 1; Fnode 2; Fnode 3]]]. split. 1: left; auto.
         split; constructor; auto. apply Exists_cons_hd. constructor. simpl. auto.
   Qed.
@@ -470,7 +546,7 @@ Section SGX_FS.
       match findMatchedFid fs path fname with
       | None => return_ (0, eBadF)
       | Some fId =>
-        let opos := find (fun x => (fst x) =? fId) fs.(open_handles) in
+        let opos := find (fun x => Nat.eqb (fst x) fId) fs.(open_handles) in
         match opos with
         | Some _ => return_ (fId, eBadF)
         | None =>
@@ -483,6 +559,7 @@ Section SGX_FS.
         end
       end.
 
+  (* Compute (fs_open ("root" :: nil) "" (mkfs "root")). *)
 
   Definition prod_dec {A B: Type} (a_dec: forall x y: A, {x = y} + {x <> y})
              (b_dec: forall x y: B, {x = y} + {x <> y}) (n m: (A * B)) : {n = m} + {n <> m}.
@@ -496,7 +573,7 @@ Section SGX_FS.
 
   Definition fs_close (fId: fs_parameter 2): State FSState (fs_result 2) :=
     do oh <- getOpenHandles;
-      let opos := find (fun x => (fst x) =? fId) oh in
+      let opos := find (fun x => Nat.eqb (fst x) fId) oh in
       match opos with
       | None => return_ eBadF
       | Some t =>
@@ -520,6 +597,8 @@ Section SGX_FS.
   Definition dCntFS (fs: FSState) := @dnode_ctr (fst fs).
   Definition logFS (fs: FSState) := snd fs.
   Definition fsFS (fs: FSState) := fst fs.
+  Definition memHandleFS (fs: FSState) := @mmap_handles (fst fs).
+  Definition memoryFS (fs: FSState) := @mmap_memory (fst fs).
 
   Definition f_map_append_page (fmap: Fid -> FData) (fId : Fid)
              (page : Pgid) : (Fid -> FData) :=
@@ -544,6 +623,7 @@ Section SGX_FS.
                  end
     end.
 
+  Compute upd_nth [1; 2; 3; 4; 5] 2 1000.
 
   Definition inputOrder (i1 i2 : string) := String.length i1 < String.length i2.
 
@@ -596,7 +676,9 @@ Section SGX_FS.
                  end
     end.
 
+  Compute override [] 0 [5; 6; 7].
 
+  Compute override [1; 2; 3; 4] 1 [5; 6].
 
   Definition write_to_virtual_memory : string -> nat -> Fid -> (Fid -> FData) -> list Page -> sum (list Page * (Fid -> FData)) ErrCode.
     refine (
@@ -611,7 +693,7 @@ Section SGX_FS.
                     let pgn := if Nat.eq_dec pg_offset O then pos / psize + 1 else pos / psize in
                     let vpg := nth pgn (fmap fId).(pageIdsF) memory_upper_bound in
                     let vpg_ret :=
-                        if Bool.bool_dec (andb (vpg =? memory_upper_bound) (pg_offset =? O)) true
+                        if Bool.bool_dec (andb (Nat.eqb vpg memory_upper_bound) (Nat.eqb pg_offset O)) true
                         then (get_next_free_vpg new_map, true) else (vpg, false) in
                     let vpg := fst vpg_ret in
                     if Nat.eq_dec vpg memory_upper_bound
@@ -695,12 +777,12 @@ Section SGX_FS.
     let (fidBuf, pos) := arg in
     let (fId, buf) := fidBuf in
     do fs <- getFS;
-      let opos := find (fun x => (fst x) =? fId) fs.(open_handles) in
+      let opos := find (fun x => Nat.eqb (fst x) fId) fs.(open_handles) in
       match opos with
       | None => return_ eBadF
       | Some _ =>
         let fsize := (fs.(f_map) fId).(metaF).(size) in
-        if (Nat.leb fsize pos) && ((negb (pos =? O)) || (negb (fsize =? O)))
+        if (Nat.leb fsize pos) && ((negb (Nat.eqb pos O)) || (negb (Nat.eqb fsize O)))
         then return_ eInval
         else match write_to_virtual_memory buf pos fId fs.(f_map) fs.(virtual_memory) with
              | inr err => return_ err
@@ -725,6 +807,7 @@ Section SGX_FS.
              end
       end.
 
+  (* max (new_f_map fId).(metaF).(size) (pos + len) *)
 
   Definition size_changed (fId: Fid) (fs postFS: FSState) (pos len: nat): Prop :=
     ((fMapFS postFS) fId).(metaF).(size) = max (((fMapFS fs) fId).(metaF).(size)) (pos + len).
@@ -732,12 +815,12 @@ Section SGX_FS.
   Definition fs_seek (arg: fs_parameter 4) : State FSState (fs_result 4) :=
     let (fId, pos) := arg in
     do fs <- getFS;
-      let opos := find (fun x => (fst x) =? fId) fs.(open_handles) in
+      let opos := find (fun x => Nat.eqb (fst x) fId) fs.(open_handles) in
       match opos with
       | None => return_ eBadF
       | Some _ =>
         let fsize := (fs.(f_map) fId).(metaF).(size) in
-        if (Nat.leb fsize pos) && ((negb (pos =? O)) || (negb (fsize =? O)))
+        if (Nat.leb fsize pos) && ((negb (Nat.eqb pos O)) || (negb (Nat.eqb fsize O)))
         then return_ eInval
         else
           do err <- externalCall (Call_VLSeek fId (pos_to_vpage pos)) (v_lseek fId (pos_to_vpage pos));
@@ -756,11 +839,14 @@ Section SGX_FS.
                        else Dnode did' (map (fun t => addFnodeToTree t did fId) li)
     end.
 
+  Compute (addFnodeToTree (addFnodeToTree (addFnodeToTree (addFnodeToTree sampleTree 9 5) 8 6) 0 7) 1 8).
 
   Definition get_next_free_fid : State FSState Fid :=
     fun x =>
       let (fs, logs) := x in
-      (fs.(fnode_ctr), (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory) fs.(f_map) fs.(d_map) (fs.(fnode_ctr) + 1) fs.(dnode_ctr), logs)).
+      (fs.(fnode_ctr), (Build_FileSystem fs.(layout) fs.(open_handles)
+       fs.(virtual_memory) fs.(f_map) fs.(d_map) (fs.(fnode_ctr) + 1)
+       fs.(dnode_ctr) fs.(mmap_handles) fs.(mmap_memory), logs)).
 
   Definition fs_create (arg: fs_parameter 5) : State FSState (fs_result 5) :=
     let (pf, p) := arg in
@@ -798,12 +884,16 @@ Section SGX_FS.
   Definition get_next_free_did : State FSState Did :=
     fun x =>
       let (fs, logs) := x in
-      (fs.(dnode_ctr), (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory) fs.(f_map) fs.(d_map) fs.(fnode_ctr) (fs.(dnode_ctr) + 1), logs)).
+      (fs.(dnode_ctr), (Build_FileSystem fs.(layout) fs.(open_handles)
+       fs.(virtual_memory) fs.(f_map) fs.(d_map) fs.(fnode_ctr)
+       (fs.(dnode_ctr) + 1) fs.(mmap_handles) fs.(mmap_memory), logs)).
 
   Definition putDMap: (Did -> DData) -> State FSState unit :=
     fun dmap x =>
       let (fs, logs) := x in
-      (tt, (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory) fs.(f_map) dmap fs.(fnode_ctr) fs.(dnode_ctr), logs)).
+      (tt, (Build_FileSystem fs.(layout) fs.(open_handles) fs.(virtual_memory)
+            fs.(f_map) dmap fs.(fnode_ctr) fs.(dnode_ctr) fs.(mmap_handles)
+            fs.(mmap_memory), logs)).
 
   Definition change_d_map (dmap: Did -> DData) (dId : Did) (ddata: DData) : (Did -> DData) :=
     fun id : Did => if Nat.eq_dec id dId then ddata else dmap id.
@@ -854,7 +944,9 @@ Section SGX_FS.
                 end
       end.
 
+  Compute (fst (mkfs "root")).(layout).
 
+  Compute let fss := (mkfs "root") in let fs := fst fss in findDir fs.(d_map) fs.(layout) [].
 
   Fixpoint removeDirFromList (trees: list Tree) (did: Did) : list Tree :=
     match trees with
@@ -990,7 +1082,7 @@ Section SGX_FS.
   Definition fs_fstat (fId: fs_parameter 11): State FSState (fs_result 11) :=
     do fs <- getFS;
       do oh <- getOpenHandles;
-      let opos := find (fun x => (fst x) =? fId) oh in
+      let opos := find (fun x => Nat.eqb (fst x) fId) oh in
       match opos with
       | None => return_ ((EmptyString, fff, O, nil), eBadF)
       | Some (_, pos) =>
@@ -1001,16 +1093,18 @@ Section SGX_FS.
                 return_ ((fd.(nameF), fd.(metaF).(permission), fd.(metaF).(size), fd.(pageIdsF)), eSucc))
       end.
 
+  (* TODO: check the pointer in open handles *)
+
   Definition fs_truncate (arg: fs_parameter 12): State FSState (fs_result 12) :=
     let (fId, len) := arg in
     do fs <- getFS;
-      match find (fun x : nat * nat => fst x =? fId) (open_handles fs) with
+      match find (fun x : nat * nat => Nat.eqb (fst x) fId) (open_handles fs) with
       | None => return_ eBadF
       | Some _ =>
         let fsize := size (metaF (f_map fs fId)) in
-        if (fsize <? len) && (negb (len =? 0) || negb (fsize =? 0))
+        if (fsize <? len) && (negb (Nat.eqb len 0) || negb (Nat.eqb fsize 0))
         then return_ eInval
-        else if (fsize =? len)
+        else if (Nat.eqb fsize len)
              then return_ eSucc
              else let new_last_page := if Nat.eq_dec (len mod psize) O then len / psize else len / psize + 1 in
                   let last_page_content := encrypt_page (truncate_page (byte_list_to_string
@@ -1023,11 +1117,112 @@ Section SGX_FS.
                                 return_ eSucc)
       end.
 
+  Lemma mmap_mode_eq_dec: forall m1 m2: MmapMode, {m1 = m2} + {~ m1 = m2}.
+  Proof. intros. destruct m1, m2; try (left; easy); try (right; easy). Qed.
+
+  Fixpoint check_if_continuous (addrs: list Memid) : bool :=
+    match addrs with
+    | nil => true
+    | n :: l' => match l' with
+                 | nil => true
+                 | m :: l'' => if Nat.eq_dec m (S n)
+                               then check_if_continuous l'
+                               else false
+                 end
+    end.
+
+  Compute (check_if_continuous [2; 3; 4; 5; 6; 7]).
+
+  Compute (check_if_continuous [2; 3; 4; 5; 6; 8]).
+
+  Definition check_size (addr_len total_len: nat): bool :=
+    if Nat.eq_dec addr_len O
+    then false
+    else if ge_dec (addr_len * block_size) total_len
+         then if lt_dec ((pred addr_len) * block_size) total_len
+              then true
+              else false
+         else false.
+
+  Compute (check_size O 5).
+  Compute (check_size 1 4000).
+
+  Fixpoint check_range (addrs: list Memid) (len: nat): bool :=
+    match addrs with
+    | nil => true
+    | x :: l => if lt_dec x len
+                then check_range l len
+                else false
+    end.
+
+  Compute (check_range [1;2;3;4;5] 6).
+  Compute (check_range [1;2;3;4;5] 5).
+
+  Definition write_zeroes (addrs: list Memid) (mem: MmapedMemory) : MmapedMemory :=
+    match addrs with
+    | nil => mem
+    | x :: _ => let len := length addrs in
+                app (app (firstn x mem) (repeat (repeat Ascii.zero block_size) len))
+                    (skipn (x + len) mem)
+    end.
+
+  Definition interval_between (n start len: nat) : bool :=
+    if le_dec start n then if lt_dec n (start + len) then true else false else false.
+
+  Definition interval_overlap (s1 len1 s2 len2: nat): bool :=
+    interval_between s1 s2 len2 || interval_between s2 s1 len1.
+
+  Fixpoint check_overlap (start: Memid) (addrs_len: nat)
+           (handles: list (Memid * nat * Permission)): bool :=
+    match handles with
+    | nil => false
+    | ((s2, t_len), _) :: l =>
+      if interval_overlap start addrs_len s2 (pad_size t_len)
+      then true
+      else check_overlap start addrs_len l
+    end.
+
+  Definition mmap (len: nat) (perm: Permission) (flag: MmapMode):
+    State FSState (Memid * ErrCode):=
+    do fs <- getFS;
+      if mmap_mode_eq_dec flag mapAnon
+      then let mem := mmap_memory fs in
+           do mmap_address <- externalCall (Call_AllocMem mem len)
+              (allocate_memory mem len);
+             let addrs_len := length mmap_address in
+             let head_addr := hd O mmap_address in
+             if check_if_continuous mmap_address &&
+                check_size addrs_len len &&
+                check_range mmap_address (length mem) &&
+                negb (check_overlap head_addr addrs_len (mmap_handles fs))
+             then putMmapMemory (write_zeroes mmap_address mem) >>
+                  putMmapHandles ((head_addr, len, perm) :: (mmap_handles fs)) >>
+                  return_ (head_addr, eSucc)
+           else return_ (O, eMapFailed)
+      else return_ (O, eMapFailed).
+
+  Definition neqMmapHandle (mid: Memid) (len: nat)
+             (h: Memid * nat * Permission) : bool :=
+    match h with | (s, lens, _) => negb (Nat.eqb mid s) || negb (Nat.eqb len lens) end.
+
+  Definition munmap (mid: Memid) (len: nat): State FSState ErrCode :=
+    do fs <- getFS;
+      if forallb (neqMmapHandle mid len) (mmap_handles fs)
+      then return_ eInval
+      else let mem := mmap_memory fs in
+           do succ <- externalCall (Call_DeallocMem mem mid len)
+              (deallocate_memory mem mid len);
+             if succ
+             then putMmapHandles (filter (neqMmapHandle mid len) (mmap_handles fs)) >>
+                  return_ eSucc
+             else return_ eInval.
+
   Definition newFS1 : FSState := snd (fs_create ([], "foo.txt", ttf) (mkfs "root")).
 
+  (* Compute (fs_create [] "bar.txt" ttf newFS1). *)
 
   Lemma find_Fid_In: forall (l: list (Fid * nat)) fId p,
-      find (fun x : nat * nat => fst x =? fId) l = Some p -> In fId (map fst l).
+      find (fun x : nat * nat => Nat.eqb (fst x) fId) l = Some p -> In fId (map fst l).
   Proof.
     induction l; intros; simpl in *. 1: inversion H.
     destruct (Nat.eqb (@fst nat nat a) fId) eqn: ?; [left | right].
@@ -1036,7 +1231,7 @@ Section SGX_FS.
   Qed.
 
   Lemma find_Fid_In': forall (l: list (Fid * nat)) fId p,
-      find (fun x : nat * nat => fst x =? fId) l = Some p -> In p l /\ fst p = fId.
+      find (fun x : nat * nat => Nat.eqb (fst x) fId) l = Some p -> In p l /\ fst p = fId.
   Proof.
     induction l; intros; simpl in *. 1: inversion H.
     destruct (Nat.eqb (@fst nat nat a) fId) eqn: ?.
@@ -1045,7 +1240,7 @@ Section SGX_FS.
   Qed.
 
   Lemma find_Fid_None: forall (l : list (Fid * nat)) fId,
-      In fId (map fst l) -> find (fun x  => fst x =? fId) l = None -> False.
+      In fId (map fst l) -> find (fun x  => Nat.eqb (fst x) fId) l = None -> False.
   Proof.
     induction l; intros; simpl in *; auto.
     destruct (Nat.eqb (@fst nat nat a) fId) eqn: ?. 1: inversion H0. destruct H.
@@ -1058,7 +1253,7 @@ Section SGX_FS.
       postFS = fs /\ err = eBadF.
   Proof.
     intros. destruct fs. unfold fs_close in H0. destruct f eqn:?. simpl in H0.
-    destruct (find (fun x : nat * nat => fst x =? fId) open_handles0) eqn:?.
+    destruct (find (fun x : nat * nat => Nat.eqb (fst x) fId) open_handles0) eqn:?.
     - exfalso. clear H0. unfold openhandleFS in H. unfold open_handles in H.
       simpl in H. apply H. apply (find_Fid_In _ _ p); auto.
     - inversion H0. auto.
@@ -1081,7 +1276,7 @@ Section SGX_FS.
                      destruct A eqn:? end.
 
   Lemma find_Fid_remove: forall (l: list (Fid * nat)) p fId,
-      NoDup (map fst l) -> find (fun x : nat * nat => fst x =? fId) l = Some p ->
+      NoDup (map fst l) -> find (fun x : nat * nat => Nat.eqb (fst x) fId) l = Some p ->
       ~ In fId (map fst (remove (prod_dec Nat.eq_dec Nat.eq_dec) p l)).
   Proof.
     induction l; intros; simpl in *. 1: inversion H0. rm_hmatch.
@@ -1103,7 +1298,7 @@ Section SGX_FS.
   Qed.
 
   Lemma find_Fid_Permutation: forall (l: list (Fid * nat)) p fId,
-      NoDup (map fst l) -> find (fun x : nat * nat => fst x =? fId) l = Some p ->
+      NoDup (map fst l) -> find (fun x : nat * nat => Nat.eqb (fst x) fId) l = Some p ->
       Permutation (map fst l)
                   (fId :: map fst (remove (prod_dec Nat.eq_dec Nat.eq_dec) p l)).
   Proof.
@@ -1123,7 +1318,7 @@ Section SGX_FS.
         2: constructor. constructor. assumption.
   Qed.
 
-
+  (* We need a stronger condition for open_handles *)
   Lemma fs_close_found: forall fId (fs: FSState) err postFS,
       NoDup (map fst (openhandleFS fs)) ->
       In fId (map fst (openhandleFS fs)) ->
@@ -1140,7 +1335,7 @@ Section SGX_FS.
                          layoutFS, vmFS, fMapFS, dMapFS in *.
     simpl in *. rename H2 into Heqp. unfold fs_close in Heqp.
     destruct f eqn:?. simpl in *.
-    destruct (find (fun x : nat * nat => fst x =? fId) open_handles0) eqn:?.
+    destruct (find (fun x : nat * nat => Nat.eqb (fst x) fId) open_handles0) eqn:?.
     - unfold externalCall in Heqp.
       destruct (v_close fId (Datatypes.length l)) eqn: ?; [|inversion H1..].
       unfold putOpenHandles in Heqp. inversion Heqp. split; [|intuition]. simpl.
@@ -1154,7 +1349,7 @@ Section SGX_FS.
       (err, postFS) = fs_close fId fs -> err = v_err /\ fst fs = fst postFS.
   Proof.
     intros. destruct fs. rename H2 into Heqp. unfold fs_close in Heqp. simpl in *.
-    destruct (find (fun x : nat * nat => fst x =? fId) f.(open_handles)) eqn:?.
+    destruct (find (fun x : nat * nat => Nat.eqb (fst x) fId) f.(open_handles)) eqn:?.
     - unfold externalCall in Heqp. unfold counter in H0.
       simpl in H0. destruct postFS. simpl.
       destruct (v_close fId (Datatypes.length l)) eqn:? ;
@@ -1174,6 +1369,8 @@ Section SGX_FS.
        fMapFS fs = fMapFS postFS /\ dMapFS fs = dMapFS postFS /\ err = eSucc /\
        fnode_ctr (fsFS fs) = fnode_ctr (fsFS postFS) /\
        dnode_ctr (fsFS fs) = dnode_ctr (fsFS postFS) /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        logFS postFS = Call_VClose fId eSucc :: logFS fs) \/
       (In fId (map fst (openhandleFS fs)) /\ err <> eSucc /\ fst fs = fst postFS /\
        logFS postFS = Call_VClose fId err :: logFS fs).
@@ -1183,7 +1380,7 @@ Section SGX_FS.
       simpl in H0. rm_hmatch; [|right; inversion H0; simpl; intuition; inversion H2..].
       left. simpl in H0. inversion H0.
       unfold openhandleFS, layoutFS, vmFS, fMapFS, dMapFS, logFS. simpl.
-      split; [|split; [|split; [|split; [|split; [|split; [|split]]]]]]; auto.
+      split; [|split; [|split; [|split; [|split; [|split; [|split;[|split]]]]]]]; auto.
       * apply find_Fid_remove; auto. destruct H. intuition.
       * simpl fst in H1. destruct H as [_ [_ [_ [_ [_ [? _]]]]]]. simpl in *.
         apply find_Fid_Permutation; assumption.
@@ -1195,7 +1392,7 @@ Section SGX_FS.
       (buf, err, postFS) = (fs_read (fId, len) fs) -> postFS = fs /\ err = eBadF.
   Proof.
     intros. destruct fs. unfold fs_read in H0. destruct f eqn:?. simpl in H0.
-    destruct (find (fun x : nat * nat => fst x =? fId) open_handles0) eqn:?.
+    destruct (find (fun x : nat * nat => Nat.eqb (fst x) fId) open_handles0) eqn:?.
     - exfalso. clear H0. unfold openhandleFS in H. unfold open_handles in H.
       simpl in H. apply H. apply (find_Fid_In _ _ p); auto.
     - inversion H0. auto.
@@ -1264,6 +1461,8 @@ Section SGX_FS.
        dMapFS fs = dMapFS postFS /\
        fnode_ctr (fsFS fs) = fnode_ctr (fsFS postFS) /\
        dnode_ctr (fsFS fs) = dnode_ctr (fsFS postFS) /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        map fst (openhandleFS postFS) = map fst (openhandleFS fs) /\
        (forall pos, In (fId, pos) (openhandleFS fs) ->
                     In (fId, pos + len) (openhandleFS postFS)) /\
@@ -1292,7 +1491,8 @@ Section SGX_FS.
              ++ right. destruct (verify_page (decrypt_page str)).
                 ** right. simpl in H1. inversion H1. destruct f. simpl.
                    unfold openhandleFS, layoutFS, vmFS, fMapFS, dMapFS, logFS, snd.
-                   split; [|split; [|split; [|split; split; [|split; [|split; [|split; [|split; [|split; [|split]]]]]]]]]; auto.
+                   simpl.
+                   split; [|split; [|split; [|split; split; [|split; [|split; [|split; [|split; [|split; [|split; [|split; [|split]]]]]]]]]]]; auto.
                    --- rewrite truncate_page_length; intuition.
                    --- simpl. rewrite replace_handler_preserve_fst; auto.
                    --- unfold open_handles in *. unfold openhandleFS in *. simpl in *.
@@ -1459,6 +1659,8 @@ Section SGX_FS.
        fMapFS fs = fMapFS postFS /\ dMapFS fs = dMapFS postFS /\
        fnode_ctr (fsFS fs) = fnode_ctr (fsFS postFS) /\
        dnode_ctr (fsFS fs) = dnode_ctr (fsFS postFS) /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        openhandleFS postFS = (fId, 0) :: openhandleFS fs /\
        NoDup (map fst (openhandleFS postFS)) /\
        (hd_error (logFS postFS) = Some (Call_VOpen path fname eSucc) /\
@@ -1502,7 +1704,7 @@ Section SGX_FS.
            let pg_offset := pos mod psize in
            let pgn := if Nat.eq_dec pg_offset O then pos / psize + 1 else pos / psize in
            let vpg := nth pgn (fmap fId).(pageIdsF) memory_upper_bound in
-           let vpg_ret := if Bool.bool_dec (andb (vpg =? memory_upper_bound) (pg_offset =? O)) true then (get_next_free_vpg new_map, true) else (vpg, false) in
+           let vpg_ret := if Bool.bool_dec (andb (Nat.eqb vpg memory_upper_bound) (Nat.eqb pg_offset O)) true then (get_next_free_vpg new_map, true) else (vpg, false) in
            let vpg := fst vpg_ret in
            if Nat.eq_dec vpg memory_upper_bound
            then inr eNoSpc
@@ -1576,6 +1778,8 @@ Section SGX_FS.
        fMapFS fs = fMapFS postFS /\ dMapFS fs = dMapFS postFS /\
        fnode_ctr (fsFS fs) = fnode_ctr (fsFS postFS) /\
        dnode_ctr (fsFS fs) = dnode_ctr (fsFS postFS) /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        map fst (openhandleFS postFS) = map fst (openhandleFS fs) /\
        (forall cursor, In (fId, cursor) (openhandleFS fs) ->
                        In (fId, pos) (openhandleFS postFS)) /\
@@ -1708,7 +1912,7 @@ Section SGX_FS.
       remember (if Nat.eq_dec (pos mod psize) 0 then pos / psize + 1 else pos / psize)
         as pgn. remember (nth pgn (pageIdsF (fmap fId)) memory_upper_bound) as vpg.
       remember (if Bool.bool_dec
-                     ((vpg =? memory_upper_bound) && (pos mod psize =? 0)) true then
+                     ((Nat.eqb vpg memory_upper_bound) && (Nat.eqb (pos mod psize) O)) true then
                   (get_next_free_vpg fmap, true) else (vpg, false)) as vpg_ret.
       do 2 (rm_hif; [inversion H0|]).
       pose proof (write_to_virtual_memory_fmap _ _ _ _ _ _ _ H0).
@@ -1749,6 +1953,8 @@ Section SGX_FS.
                                       Call_VLSeek p4 p5 eSucc :: logFS fs) \/
       (In fId (map fst (openhandleFS fs)) /\ layoutFS fs = layoutFS postFS /\
        dMapFS fs = dMapFS postFS /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        map fst (openhandleFS postFS) = map fst (openhandleFS fs) /\
        In (fId, pos + (String.length buf)) (openhandleFS postFS) /\
        (forall id, id <> fId -> (fMapFS fs) id = (fMapFS postFS) id) /\
@@ -1812,19 +2018,19 @@ Section SGX_FS.
                 ** simpl in *. rewrite change_f_map_size_preserve_pgid in *.
                    subst pgId2. destruct (Nat.eq_dec fId1 fId); [subst fId1|];
                                   destruct (Nat.eq_dec fId2 fId); [exfalso; auto|..].
-                   --- rewrite <- H10 in H13; auto. specialize (H9 _ H12).
+                   --- rewrite <- H10 in H16; auto. specialize (H9 _ H15).
                        destruct H9 as [? | [? ?]]. 1: eapply H7; eauto.
-                       eapply H14; eauto. rewrite <- H10; auto.
-                   --- subst fId. rewrite <- H10 in H12; auto. specialize (H9 _ H13).
+                       eapply H17; eauto. rewrite <- H10; auto.
+                   --- subst fId. rewrite <- H10 in H15; auto. specialize (H9 _ H16).
                        destruct H9 as [? | [? ?]]. 1: eapply H7; eauto.
-                       eapply H14; eauto. rewrite <- H10; auto.
-                   --- rewrite <- H10 in H12, H13; auto.
+                       eapply H17; eauto. rewrite <- H10; auto.
+                   --- rewrite <- H10 in H16, H15; auto.
                        specialize (H7 fId1 fId2 pgId1 pgId1). apply H7; auto.
                 ** simpl in *. rewrite change_f_map_size_preserve_pgid in *.
                    destruct (Nat.eq_dec fId0 fId).
-                   2: rewrite <- H10 in H11; auto; eapply H8; eauto. subst fId0.
-                   specialize (H9 _ H11). destruct H9 as [? | [? ?]]; auto.
-                   eapply H8; eauto.
+                   2: rewrite <- H10 in H13; auto; eapply H11; eauto. subst fId0.
+                   specialize (H9 _ H13). destruct H9 as [? | [? ?]]; auto.
+                   eapply H11; eauto.
       + inversion H. left. split; [eapply find_Fid_In; eauto | split]; auto.
         eapply write_to_virtual_memory_err; eauto.
     - left. inversion H. intuition. eapply find_Fid_None; eauto.
@@ -2265,12 +2471,12 @@ Section SGX_FS.
                      [|split; [|split;
                                 [|split; [|split; [|split; [|split]]]]]]; simpl; auto.
                    --- apply addDidToTree_NoDupNameTree with (path := path); auto.
-                   --- apply (Permutation_NoDup H11). constructor; auto.
+                   --- apply (Permutation_NoDup H13). constructor; auto.
                    --- rewrite addDidToTree_the_same_Fids; auto.
-                   --- intros. apply Permutation_sym in H11.
-                       apply (Permutation_in el H11) in H12.
-                       simpl in H12. specialize (H5 el). destruct H12; intuition.
-                   --- intros. rewrite addDidToTree_the_same_Fids in H12.
+                   --- intros. apply Permutation_sym in H13.
+                       apply (Permutation_in el H13) in H15.
+                       simpl in H15. specialize (H5 el). destruct H15; intuition.
+                   --- intros. rewrite addDidToTree_the_same_Fids in H15.
                        apply H6; auto.
                    --- unfold isDir in *. destruct H8 as [dd [ll ?]].
                        rewrite H8. simpl. rm_if; apply DnodeIsDir.
@@ -2417,7 +2623,7 @@ Section SGX_FS.
        logFS postFS = Call_VStat id eSucc :: logFS fs).
   Proof.
     intros. unfold fs_fstat in H. simpl in H.
-    destruct (find (fun x : nat * nat => fst x =? id) (open_handles (fst fs))) eqn:? .
+    destruct (find (fun x : nat * nat => Nat.eqb (fst x) id) (open_handles (fst fs))) eqn:? .
     - destruct fs. simpl in *. destruct p. simpl in H. rm_hif; inversion H; right.
       + left. simpl. intuition. eapply find_Fid_In; eauto.
       + right. unfold openhandleFS, fMapFS, logFS. simpl. rewrite e.
@@ -2445,6 +2651,8 @@ Section SGX_FS.
        layoutFS fs = layoutFS postFS /\ openhandleFS fs = openhandleFS postFS /\
        vmFS fs = vmFS postFS /\ fMapFS fs = fMapFS postFS /\
        fCntFS fs = fCntFS postFS /\ dCntFS fs = dCntFS postFS /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        err = eSucc /\ logFS postFS = Call_VChmod path p eSucc :: logFS fs) \/
       ((exists id,
            file_in_tree_with_id (fMapFS fs) (dMapFS fs)
@@ -2458,6 +2666,8 @@ Section SGX_FS.
        openhandleFS fs = openhandleFS postFS /\ vmFS fs = vmFS postFS /\
        dMapFS fs = dMapFS postFS /\ fCntFS fs = fCntFS postFS /\
        dCntFS fs = dCntFS postFS /\ err = eSucc /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        logFS postFS = Call_VChmod path p eSucc :: logFS fs).
   Proof.
     intros. unfold fs_chmod in H0. simpl in H0.
@@ -2505,6 +2715,8 @@ Section SGX_FS.
       + destruct (IHl m) as [l' ?]. exists l'. rewrite H at 1. simpl; auto.
   Qed.
 
+  Opaque psize block_size.
+
   Lemma fs_truncate_ok:
     forall (fId : Fid) (len : nat) (fs: FSState) (err: ErrCode) (postFS : FSState),
       good_file_system (fsFS fs) -> (err, postFS) = fs_truncate (fId, len) fs ->
@@ -2519,6 +2731,8 @@ Section SGX_FS.
        layoutFS fs = layoutFS postFS /\ openhandleFS fs = openhandleFS postFS /\
        vmFS fs = vmFS postFS /\ dMapFS fs = dMapFS postFS /\
        fCntFS fs = fCntFS postFS /\ dCntFS fs = dCntFS postFS /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        (fMapFS postFS fId).(nameF) = (fMapFS fs fId).(nameF) /\
        (fMapFS postFS fId).(metaF).(permission) =
        (fMapFS fs fId).(metaF).(permission) /\
@@ -2528,7 +2742,7 @@ Section SGX_FS.
        (exists l, (fMapFS fs fId).(pageIdsF) =
                   ((fMapFS postFS fId).(pageIdsF) ++ l)%list)).
   Proof.
-    intros. unfold fs_truncate in H0. Opaque psize block_size. simpl in H0.
+    intros. unfold fs_truncate in H0. simpl in H0.
     remember (if Nat.eq_dec (len mod psize) 0 then len / psize else len / psize + 1).
     remember (len / psize * block_size).
     remember (encrypt_page
@@ -2536,7 +2750,7 @@ Section SGX_FS.
                    (byte_list_to_string (nth (nth n (pageIdsF (f_map (fst fs) fId)) 0)
                                              (virtual_memory (fst fs)) [])) 0
                    (len mod psize))).
-    destruct (find (fun x : nat * nat => fst x =? fId) (open_handles (fst fs))) eqn:? .
+    destruct (find (fun x : nat * nat => Nat.eqb (fst x) fId) (open_handles (fst fs))) eqn:? .
     - apply find_Fid_In in Heqo. right. rm_hif.
       + left. inversion H0; auto.
       + destruct fs. simpl in H0. right. rm_hmatch.
@@ -2553,6 +2767,8 @@ Section SGX_FS.
              ++ apply getSublist_prefix.
     - inversion H0. left. intuition. apply find_Fid_None in H1; auto.
   Qed.
+
+  Transparent psize block_size.
 
   Lemma addFnodeToTree_in_tree: forall fmap dmap d cnt fname meta pgids tree path,
       NoDup (collectDids tree) -> path_in_tree_with_id dmap path tree d ->
@@ -2757,8 +2973,10 @@ Section SGX_FS.
        logFS postFS = Call_VCreate path fname p eSucc :: logFS fs /\
        openhandleFS fs = openhandleFS postFS /\ vmFS fs = vmFS postFS /\
        dMapFS fs = dMapFS postFS /\ fCntFS fs + 1 = fCntFS postFS /\
-       dCntFS fs = dCntFS postFS /\ fMapFS postFS (fCntFS fs) =
-                                    Build_FData fname (Build_Meta p O) nil /\
+       dCntFS fs = dCntFS postFS /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
+       fMapFS postFS (fCntFS fs) = Build_FData fname (Build_Meta p O) nil /\
        (forall id, id <> fCntFS fs -> fMapFS fs id = fMapFS postFS id) /\
        file_in_tree_with_id (fMapFS postFS) (dMapFS postFS) path fname
                             (layoutFS postFS) (fCntFS fs) /\
@@ -2789,25 +3007,24 @@ Section SGX_FS.
                    --- simpl in *.
                        assert (~ In (fnode_ctr f) (collectFids (layout f))) by
                            (intro S; apply H6 in S; intuition).
-                       pose proof (addFnodeToTree_Permutation _ _ _ _ _ H2 Heqo1 H10).
-                       split; [|split; [|split; [|split; [|split; [|split; [|split; [|split]]]]]]];
-                         simpl; auto.
+                       pose proof (addFnodeToTree_Permutation _ _ _ _ _ H2 Heqo1 H13).
+                       split; [|split; [|split; [|split; [|split; [|split; [|split; [|split;[|split;[|split]]]]]]]]]; simpl; auto.
                        +++ apply addFnodeToTree_NoDupNameTree with (path := path);
                              auto.
                        +++ rewrite addFnodeToTree_the_same_dids. auto.
-                       +++ apply (Permutation_NoDup H12). constructor; auto.
-                       +++ intros. rewrite addFnodeToTree_the_same_dids in H13.
+                       +++ apply (Permutation_NoDup H15). constructor; auto.
+                       +++ intros. rewrite addFnodeToTree_the_same_dids in H16.
                            apply H5; auto.
-                       +++ intros. apply Permutation_sym in H12.
-                           apply (Permutation_in el H12) in H13. simpl in H13.
-                           specialize (H6 el). destruct H13; intuition.
+                       +++ intros. apply Permutation_sym in H15.
+                           apply (Permutation_in el H15) in H16. simpl in H16.
+                           specialize (H6 el). destruct H16; intuition.
                        +++ unfold isDir in H8. destruct H8 as [dd [ll ?]]. rewrite H8.
                            simpl. rm_if; apply DnodeIsDir.
-                       +++ intros. unfold change_f_map in H14, H15.
+                       +++ intros. unfold change_f_map in H18, H17.
                            rm_hif; rm_hif; simpl in *; [exfalso; auto..|]. intro.
                            apply (H9 fId1 fId2 pgId1 pgId2); auto.
-                       +++ intros. unfold change_f_map in H13. rm_hif; simpl in H13.
-                           1: exfalso; auto. eapply H11; eauto.
+                       +++ intros. unfold change_f_map in H16. rm_hif; simpl in H16.
+                           1: exfalso; auto. eapply H10; eauto.
           -- left. apply path_in_tree_none in Heqo1; auto. inversion H0; auto.
   Qed.
 
@@ -3188,8 +3405,7 @@ Section SGX_FS.
 
   Lemma fs_rmdir_ok: forall (path : Path) (fs : FSState) (err : ErrCode)
                             (postFS : FSState),
-      good_file_system (fsFS fs) ->
-      (err, postFS) = fs_rmdir path fs ->
+      good_file_system (fsFS fs) -> (err, postFS) = fs_rmdir path fs ->
       (path = nil /\ err = eInval /\ postFS = fs) \/
       (path <> nil /\ ~ path_in_tree (dMapFS fs) path (layoutFS fs) /\
        err = eNoEnt /\ postFS = fs) \/
@@ -3218,6 +3434,8 @@ Section SGX_FS.
        openhandleFS fs = openhandleFS postFS /\ vmFS fs = vmFS postFS /\
        fMapFS fs = fMapFS postFS /\ fCntFS fs = fCntFS postFS /\
        dCntFS fs = dCntFS postFS /\ path <> nil /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        ~ path_in_tree (dMapFS postFS) path (layoutFS postFS) /\
        good_file_system (fsFS postFS)).
   Proof.
@@ -3545,6 +3763,8 @@ Section SGX_FS.
        openhandleFS fs = openhandleFS postFS /\ vmFS fs = vmFS postFS /\
        dMapFS fs = dMapFS postFS /\ fCntFS fs = fCntFS postFS /\
        dCntFS fs = dCntFS postFS /\
+       mmap_handles (fsFS fs) = mmap_handles (fsFS postFS) /\
+       mmap_memory (fsFS fs) = mmap_memory (fsFS postFS) /\
        ~ file_in_tree (fMapFS postFS) (dMapFS postFS) path fname (layoutFS postFS) /\
        good_file_system (fsFS postFS)).
   Proof.
@@ -3572,28 +3792,399 @@ Section SGX_FS.
              subst postFS. clear H0. rewrite e. intuition.
              ++ exists f. unfold change_f_map. intuition; rm_if; exfalso; auto.
              ++ exists d. intuition.
-             ++ revert H8. apply removeFnodeFromTree_not_in_tree; auto.
+             ++ revert H12. apply removeFnodeFromTree_not_in_tree; auto.
              ++ pose proof (removeFnodeFromTree_Permutation
                               _ _ _ _ _ _ _ H2 H1 H Heqo0 Heqo).
-                split; [|split; [|split; [|split; [|split; [|split; [|split; [|split]]]]]]]; simpl; auto.
+                split; [|split; [|split; [|split; [|split; [|split; [|split; [|split;[|split;[|split]]]]]]]]]; simpl; auto.
                 ** eapply removeFnodeFromTree_NoDupNameTree; eauto.
                 ** rewrite removeFnodeFromTree_the_same_Dids; auto.
-                ** symmetry in H8. apply (Permutation_NoDup H8) in H2.
+                ** symmetry in H12. apply (Permutation_NoDup H12) in H2.
                    rewrite NoDup_cons_iff in H2. destruct H2; auto.
-                ** intros. rewrite removeFnodeFromTree_the_same_Dids in H11; auto.
-                ** intros. apply Permutation_in with (x := el) in H8; auto. simpl.
+                ** intros. rewrite removeFnodeFromTree_the_same_Dids in H14; auto.
+                ** intros. apply Permutation_in with (x := el) in H12; auto. simpl.
                    intuition.
                 ** unfold isDir in H0. destruct H0 as [dd [ll ?]]. rewrite H0.
                    simpl. rm_if; apply DnodeIsDir.
-                ** intros. unfold change_f_map in H12, H13. subst fd.
+                ** intros. unfold change_f_map in H16, H15. subst fd.
                    do 2 rm_hif; simpl in *; [exfalso; auto..|]. intro.
                    apply (H6 fId1 fId2 pgId1 pgId2); auto.
-                ** intros. unfold change_f_map in H11. subst fd. rm_hif; simpl in *.
+                ** intros. unfold change_f_map in H14. subst fd. rm_hif; simpl in *.
                    --- exfalso; auto.
-                   --- eapply H10; eauto.
+                   --- eapply H8; eauto.
       + exfalso. apply path_in_tree_none in Heqo0; auto. apply Heqo0.
         eapply file_in_tree_path_in_tree; eauto.
     - left. apply file_in_tree_none in Heqo; auto. inversion H0. intuition.
+  Qed.
+
+  Inductive Sequential: list Memid -> Prop :=
+  | Seq_nil: Sequential nil
+  | Seq_one: forall m, Sequential [m]
+  | Seq_cons: forall m l, Sequential (S m :: l) -> Sequential (m :: S m :: l).
+
+  Lemma check_if_continuous_ok: forall l,
+      check_if_continuous l = true <-> Sequential l.
+  Proof.
+    intros. induction l; simpl. 1: split; intros; [constructor | easy]. destruct l.
+    - split; intros; [constructor | easy].
+    - rm_if; split; intros; try easy.
+      + subst m. constructor. rewrite <- IHl. easy.
+      + inversion H. subst. rewrite IHl. easy.
+      + inversion H. subst. easy.
+  Qed.
+
+  Lemma check_size_ok: forall len1 len2,
+      check_size len1 len2 = true <-> len1 <> 0 /\ len1 = pad_size len2.
+  Proof.
+    intros. unfold check_size. rm_if.
+    - split; intros; [| destruct H]; easy.
+    - assert (HS: block_size <> 0) by (compute; intro HS'; inversion HS').
+      assert (HT: 0 < block_size) by (compute; omega). rm_if.
+      + rm_if; split; intros; try easy.
+        * split; auto. destruct len1. 1: easy. simpl in l. unfold pad_size. rm_if.
+          -- rewrite <- Nat.div_exact in e; auto. rewrite Nat.mul_comm in e.
+             rewrite e in g, l. rewrite <- Nat.mul_lt_mono_pos_r in l; auto.
+             unfold ge in g. rewrite <- Nat.mul_le_mono_pos_r in g; auto. omega.
+          -- f_equal. unfold ge in g. rewrite Nat.le_lteq in g. destruct g.
+             ++ rewrite Nat.mul_succ_l in H0.
+                rewrite (S_pred_pos block_size) in H0 at 2; auto.
+                rewrite Nat.add_succ_r in H0. apply lt_n_Sm_le in H0.
+                apply Nat.div_le_mono with (c := block_size) in H0; auto.
+                rewrite Nat.div_add_l in H0; auto. apply Nat.lt_le_incl in l.
+                rewrite (Nat.div_small (pred block_size)) in H0.
+                2: compute; apply le_n.
+                apply Nat.div_le_mono with (c := block_size) in l; auto.
+                rewrite Nat.div_mul in l; auto. omega.
+             ++ exfalso. apply n0. rewrite Nat.mod_divides; auto. exists (S len1).
+                rewrite Nat.mul_comm. easy.
+        * destruct H. destruct len1. 1: easy. simpl Init.Nat.pred in n0.
+          apply not_lt in n0. unfold pad_size in H0. clear n H g. unfold ge in n0.
+          rm_hif.
+          -- apply Nat.div_le_mono with (c := block_size) in n0; auto.
+             rewrite Nat.div_mul in n0; auto. omega.
+          -- Opaque block_size. inversion H0. clear H0. Transparent block_size.
+             exfalso. destruct len1.
+             ++ assert (len2 = O) by omega. subst. apply n, Nat.mod_0_l; auto.
+             ++ rewrite Nat.le_lteq in n0. destruct n0.
+                ** rewrite Nat.mul_succ_l in H.
+                   rewrite (S_pred_pos block_size) in H at 2; auto.
+                   rewrite Nat.add_succ_r in H. apply lt_n_Sm_le in H.
+                   apply Nat.div_le_mono with (c := block_size) in H; auto.
+                   rewrite Nat.div_add_l in H; auto.
+                   rewrite (Nat.div_small (pred block_size)) in H.
+                   2: compute; apply le_n. omega.
+                ** apply n. rewrite Nat.mod_divides; auto. exists (S len1).
+                   rewrite Nat.mul_comm. easy.
+      + split; intros. 1: easy. destruct H. subst. exfalso. apply n0.
+        unfold pad_size. rm_if.
+        * rewrite <- Nat.div_exact in e; auto.
+          rewrite Nat.mul_comm. rewrite <- e. omega.
+        * unfold ge. rewrite Nat.mul_comm. apply Nat.lt_le_incl.
+          apply Nat.mul_succ_div_gt; auto.
+  Qed.
+
+  Lemma check_range_ok: forall l u, check_range l u = true <->
+                                    forall i, In i l -> i < u.
+  Proof.
+    intros. induction l; simpl; split; intros; try easy.
+    - rm_hif. 2: easy. destruct H0. 1: subst; easy. rewrite IHl in H. apply H; auto.
+    - rm_if. rewrite IHl; intros; apply H; right; easy.
+  Qed.
+
+  Lemma pad_size_neq_O: forall len, len <> 0 <-> pad_size len <> 0.
+  Proof.
+    intros. assert (HS: block_size <> 0) by (compute; intro HS; inversion HS).
+    split; intros.
+    - unfold pad_size. rm_if. rewrite <- Nat.div_exact in e; auto.
+      remember (len / block_size). destruct n; auto.
+    - unfold pad_size in H. rm_hif.
+      + rewrite <- Nat.div_exact in e; auto. remember (len / block_size). rewrite e.
+        intro. pose proof (Nat.mul_eq_0_r _ _ H0 HS). auto.
+      + destruct len; auto.
+  Qed.
+
+  Opaque pad_size.
+
+  Lemma interval_between_ok: forall n start len,
+      interval_between n start len = false <-> n < start \/ start + len <= n.
+  Proof.
+    intros. unfold interval_between. rm_if; [rm_if |]; split; intros; try easy; omega.
+  Qed.
+
+  Transparent pad_size.
+
+  Lemma interval_overlap_ok: forall s1 len1 s2 len2,
+      len1 <> O -> len2 <> O ->
+      interval_overlap s1 (pad_size len1) s2 (pad_size len2) = false <->
+      forall p1 p2, Disjoint (s1, len1, p1) (s2, len2, p2).
+  Proof.
+    intros. simpl. unfold interval_overlap. rewrite Bool.orb_false_iff.
+    rewrite !interval_between_ok. split; intros.
+    - destruct H1. destruct H1, H2; omega.
+    - specialize (H1 ttf ttf). split.
+      + destruct H1; [left | right]; auto. rewrite pad_size_neq_O in H. omega.
+      + destruct H1; [right | left]; auto. rewrite pad_size_neq_O in H0. omega.
+  Qed.
+
+  Lemma NoNull_cons_inv: forall x l, NoNull (x :: l) -> NoNull l.
+  Proof.
+    intros. unfold NoNull in *. rewrite Forall_forall in *.
+    intros. apply H. right; auto.
+  Qed.
+
+  Lemma check_overlap_ok: forall s len h,
+      len <> 0 -> NoNull h ->
+      check_overlap s (pad_size len) h = false <->
+      forall p i, In i h -> Disjoint (s, len, p) i.
+  Proof.
+    intros. induction h; simpl; split; intros; try easy; destruct a as [[s1 len1] ?].
+    - destruct i as [[s2 len2] ?]. rm_hif_eqn H. 1: inversion H1. destruct H2.
+      + inversion H2. subst. rewrite interval_overlap_ok in Heqb; auto.
+        * specialize (Heqb p p). red in Heqb. easy.
+        * red in H0. rewrite Forall_forall in H0. red in H0.
+          specialize (H0 (s2, len2, p1) (in_eq _ _)). simpl in H0. easy.
+      + rewrite IHh in H1.
+        * specialize (H1 p _ H2). simpl in H1. easy.
+        * apply NoNull_cons_inv in H0. easy.
+    - rm_if_eqn.
+      + rewrite <- Bool.not_false_iff_true in Heqb. exfalso. apply Heqb.
+        rewrite interval_overlap_ok; auto.
+        * intros. simpl. specialize (H1 p1 (s1, len1, p) (or_introl eq_refl)).
+          simpl in H1. easy.
+        * red in H0. rewrite Forall_forall in H0. specialize (H0 _ (in_eq _ _)).
+          red in H0. easy.
+      + rewrite IHh.
+        * intros. specialize (H1 p i (or_intror H2)). unfold Disjoint. easy.
+        * apply NoNull_cons_inv in H0. easy.
+  Qed.
+
+  Lemma Sequential_In: forall h l,
+      Sequential l -> hd_error l = Some h ->
+      forall i, In i l <-> h <= i < h + length l.
+  Proof.
+    intros ? ?. revert h. induction l; intros; simpl. 1: split; intros; omega.
+    simpl in H0. inversion H0. subst. clear H0. destruct l. 1: simpl; omega.
+    inversion H. subst. rewrite (IHl (S h)); simpl; auto. omega.
+  Qed.
+
+  Lemma write_zeroes_length: forall addrs mem,
+      (forall i, In i addrs -> i < length mem) -> Sequential addrs ->
+      length (write_zeroes addrs mem) = length mem.
+  Proof.
+    intros. unfold write_zeroes. destruct addrs. 1: easy. rewrite !app_length.
+    rewrite firstn_length_le. 2: apply Nat.lt_le_incl, H; left; easy.
+    rewrite repeat_length. assert (hd_error (n :: addrs) = Some n) by easy.
+    pose proof (firstn_skipn (n + length (n :: addrs)) mem).
+    rewrite <- H2 at 2. rewrite app_length. f_equal.
+    rewrite firstn_length_le; auto. clear H2. simpl.
+    assert (In (n + length addrs) (n :: addrs)). {
+      rewrite (Sequential_In n); auto. simpl. split; try omega.
+      rewrite <- Nat.add_lt_mono_l. apply Nat.lt_succ_diag_r. }
+    apply H in H2. omega.
+  Qed.
+
+  Lemma write_zeroes_In: forall addrs mem,
+      (forall i, In i addrs -> i < length mem) -> Sequential addrs ->
+      forall i, In i addrs -> nth i (write_zeroes addrs mem) nil =
+                              repeat Ascii.zero block_size.
+  Proof.
+    intros. unfold write_zeroes. destruct addrs. 1: inversion H1.
+    rewrite (Sequential_In n) in H1; auto.
+    assert (length (firstn n mem) = n) by
+        (rewrite firstn_length_le; [omega | apply Nat.lt_le_incl, H; left; easy]).
+    rewrite <- app_assoc, app_nth2; rewrite H2. 2: omega. rewrite app_nth1.
+    - remember (repeat Ascii.zero block_size).
+      assert (i - n < length (n :: addrs)) by (unfold Memid in H1; omega).
+      pose proof (@nth_In _ (i - n) (repeat l (length (n :: addrs))) nil).
+      rewrite repeat_length in H4. apply H4 in H3. clear H4. apply repeat_spec in H3.
+      easy.
+    - rewrite repeat_length. omega.
+  Qed.
+
+  Lemma mmap_ok: forall len perm flag fs mid err postFS,
+      (mid, err, postFS) = mmap len perm flag fs -> NoNull (memHandleFS fs) ->
+      (flag <> mapAnon /\ postFS = fs /\ err = eMapFailed) \/
+      (flag = mapAnon /\
+       exists p1 p2 addrs,
+         hd_error (logFS postFS) = Some (Call_AllocMem p1 p2 addrs) /\
+         ((Sequential addrs /\ length addrs <> 0 /\ length addrs = pad_size len /\
+           (forall i, In i addrs -> i < length (memoryFS fs)) /\
+           (forall p i, In i (memHandleFS fs) -> Disjoint (mid, len, p) i) /\
+           hd_error addrs = Some mid /\ layoutFS fs = layoutFS postFS /\
+           openhandleFS fs = openhandleFS postFS /\ vmFS fs = vmFS postFS /\
+           fMapFS fs = fMapFS postFS /\ dMapFS fs = dMapFS postFS /\
+           fnode_ctr (fsFS fs) = fnode_ctr (fsFS postFS) /\
+           dnode_ctr (fsFS fs) = dnode_ctr (fsFS postFS) /\
+           memHandleFS postFS = (mid, len, perm) :: memHandleFS fs /\
+           length (memoryFS postFS) = length (memoryFS fs) /\ err = eSucc /\
+           (forall i, In i addrs -> nth i (memoryFS postFS) nil =
+                                    repeat Ascii.zero block_size) /\
+           (forall m, In m (memoryFS postFS) -> In m (memoryFS fs) \/
+                                                m = repeat Ascii.zero block_size)) \/
+          (err = eMapFailed /\ fsFS postFS = fsFS fs))).
+  Proof.
+    intros. unfold mmap in H. simpl in H. rm_hif.
+    - right. destruct fs as [fs ?]. simpl in H. unfold memHandleFS in H0.
+      remember (allocate_memory (mmap_memory fs) len (length l)) as addrs. split; auto.
+      exists (mmap_memory fs), len, addrs. rm_hif_eqn H; simpl in H, H0.
+      + apply andb_prop in Heqb. destruct Heqb. apply andb_prop in H1. destruct H1.
+        apply andb_prop in H1. destruct H1. rewrite Bool.negb_true_iff in H2.
+        rewrite check_if_continuous_ok in H1. rewrite check_size_ok in H4. destruct H4.
+        rewrite check_range_ok in H3. rewrite H5 in H2.
+        rewrite check_overlap_ok in H2; auto.
+        * inversion H. Opaque repeat. subst postFS.
+          unfold logFS, openhandleFS, vmFS, dMapFS,
+          fCntFS, dCntFS, fMapFS, fsFS, layoutFS, memHandleFS, memoryFS in *.
+          simpl. split; auto. left. intuition.
+          -- apply (H2 p) in H6. red in H6. easy.
+          -- destruct addrs. 1: simpl in H4; exfalso; apply H4; easy. simpl; easy.
+          -- apply write_zeroes_length; auto.
+          -- apply write_zeroes_In; auto.
+          -- unfold write_zeroes in H6. destruct addrs; auto. apply in_app_or in H6.
+             destruct H6; [apply in_app_or in H6; destruct H6 | ].
+             ++ left. rewrite <- (firstn_skipn m0), in_app_iff. left; easy.
+             ++ right. apply repeat_spec in H6. easy.
+             ++ left.
+                rewrite <- (firstn_skipn (m0 + length (m0 :: addrs))), in_app_iff.
+                right; easy.
+        * rewrite H5, <- pad_size_neq_O in H4. easy.
+      + inversion H. split; auto.
+    - left. inversion H. easy.
+  Qed.
+
+  Definition neqMmapHandle_false: forall mid len s lens p,
+      neqMmapHandle mid len (s, lens, p) = false <-> mid = s /\ len = lens.
+  Proof.
+    intros. unfold neqMmapHandle.
+    rewrite Bool.orb_false_iff, !Bool.negb_false_iff, !Nat.eqb_eq. easy.
+  Qed.
+
+  Definition neqMmapHandle_true: forall mid len s lens p,
+      neqMmapHandle mid len (s, lens, p) = true <-> mid <> s \/ len <> lens.
+  Proof.
+    intros. unfold neqMmapHandle.
+    rewrite Bool.orb_true_iff, !Bool.negb_true_iff, !Nat.eqb_neq. easy.
+  Qed.
+
+  Lemma forallb_exists: forall {A : Type} (f : A -> bool) (l : list A),
+      forallb f l = false <-> (exists x : A, In x l /\ f x = false).
+  Proof.
+    intros. induction l; simpl.
+    - split; intros; try easy. destruct H as [? [? ?]]. easy.
+    - rewrite Bool.andb_false_iff. split; intros.
+      + destruct H. 1: (exists a; split; auto). rewrite IHl in H.
+        destruct H as [x [? ?]]. exists x. split; auto.
+      + destruct H as [x [[? | ?] ?]].
+        * subst. left; auto.
+        * right. rewrite IHl. exists x. split; auto.
+  Qed.
+
+  Lemma filter_perm: forall {A: Type} (f g: A -> bool) l,
+      (forall x, In x l -> f x = negb (g x)) ->
+      Permutation l (filter f l ++ filter g l).
+  Proof.
+    intros. induction l. 1: easy. simpl. pose proof (H a (or_introl eq_refl)).
+    assert (forall x : A, In x l -> f x = negb (g x)) by
+        (intros; apply H; right; easy). specialize (IHl H1). clear H1.
+    destruct (g a) eqn:?H; simpl in H0; rewrite H0.
+    - apply Permutation_cons_app; auto.
+    - apply Permutation_cons; auto.
+  Qed.
+
+  Lemma filter_perm': forall {A: Type} (f: A -> bool) l,
+      Permutation l (filter (fun x => negb (f x)) l ++ filter f l).
+  Proof. intros. apply filter_perm. intros; easy. Qed.
+
+  Lemma NoOverlap_cons_inv: forall x l, NoOverlap (x :: l) -> NoOverlap l.
+  Proof. intros. inversion H. easy. Qed.
+
+  Lemma NoOverlap_NoDup: forall l, NoOverlap l -> NoNull l -> NoDup l.
+  Proof.
+    induction l; intros; constructor.
+    - inversion H. subst. intro. specialize (H3 _ H1). destruct a as [[s len] p].
+      red in H3. red in H0. rewrite Forall_forall in H0. specialize (H0 _ (in_eq _ _)).
+      red in H0. rewrite pad_size_neq_O in H0. destruct H3; omega.
+    - apply IHl.
+      + eapply NoOverlap_cons_inv; eauto.
+      + eapply NoNull_cons_inv; eauto.
+  Qed.
+
+  Lemma filter_nil: forall {A: Type} (f: A -> bool) l,
+      filter f l = nil <-> forall i, In i l -> f i = false.
+  Proof.
+    intros. induction l.
+    - split; intros. 1: inversion H0. simpl. easy.
+    - split; intros.
+      + simpl in H. rm_hif_eqn H. 1: inversion H. simpl in H0. destruct H0.
+        1: subst; auto. apply IHl; auto.
+      + simpl. rm_if_eqn.
+        * specialize (H _ (in_eq _ _)). rewrite H in Heqb. inversion Heqb.
+        * rewrite IHl. intros. apply H. simpl. right; easy.
+  Qed.
+
+  Lemma NoNull_head: forall mid len pa l,
+      NoNull ((mid, len, pa) :: l) -> len <> O.
+  Proof.
+    intros. unfold NoNull in H. rewrite Forall_forall in H.
+    pose proof (H _ (in_eq _ _)). red in H0. easy.
+  Qed.
+
+  Lemma NoOverlap_NoNull_neq: forall mid len perm l,
+      NoOverlap l -> NoNull l -> In (mid, len, perm) l ->
+      filter (fun x => negb (neqMmapHandle mid len x)) l = [(mid, len, perm)].
+  Proof.
+    do 3 intro. induction l; intros. 1: inversion H1. simpl in H1. destruct H1.
+    - subst. simpl. rm_if_eqn.
+      + f_equal. rewrite filter_nil. intros. rewrite Bool.negb_false_iff.
+        destruct i as [[si leni] p]. rewrite neqMmapHandle_true.
+        inversion H. subst. specialize (H4 _ H1). simpl in H4. left.
+        unfold NoNull in H0. rewrite Forall_forall in H0.
+        pose proof (H0 _ (in_eq _ _)). simpl in H2.
+        specialize (H0 _ (in_cons _ _ _ H1)). simpl in H0.
+        rewrite pad_size_neq_O in H0, H2. destruct H4; omega.
+      + rewrite Bool.negb_false_iff, Bool.orb_true_iff, !Bool.negb_true_iff,
+        !Nat.eqb_neq in Heqb. exfalso. destruct Heqb; apply H1; easy.
+    - simpl. rm_if_eqn.
+      + exfalso. rewrite Bool.negb_true_iff in Heqb. destruct a as [[sa lena] pa].
+        rewrite neqMmapHandle_false in Heqb. destruct Heqb. subst sa lena.
+        inversion H. subst. specialize (H4 _ H1). red in H4. apply NoNull_head in H0.
+        rewrite pad_size_neq_O in H0. destruct H4; omega.
+      + apply IHl; auto; [eapply NoOverlap_cons_inv | eapply NoNull_cons_inv]; eauto.
+  Qed.
+
+  Lemma munmap_ok: forall mid len err fs postFS,
+      (err, postFS) = munmap mid len fs ->
+      NoOverlap (memHandleFS fs) -> NoNull (memHandleFS fs) ->
+      ((forall perm, ~ In (mid, len, perm) (memHandleFS fs)) /\
+       err = eInval /\ postFS = fs) \/
+      (exists perm p1 p2 p3 succ,
+          In (mid, len, perm) (memHandleFS fs) /\
+          hd_error (logFS postFS) = Some (Call_DeallocMem p1 p2 p3 succ) /\
+          ((succ = false /\ err = eInval /\ fsFS postFS = fsFS fs) \/
+           (succ = true /\ err = eSucc /\ layoutFS fs = layoutFS postFS /\
+            openhandleFS fs = openhandleFS postFS /\ vmFS fs = vmFS postFS /\
+            fMapFS fs = fMapFS postFS /\ dMapFS fs = dMapFS postFS /\
+            fnode_ctr (fsFS fs) = fnode_ctr (fsFS postFS) /\
+            dnode_ctr (fsFS fs) = dnode_ctr (fsFS postFS) /\
+            memoryFS postFS = memoryFS fs /\
+            Permutation ((mid, len, perm) :: memHandleFS postFS) (memHandleFS fs)))).
+  Proof.
+    intros. unfold munmap in H. simpl in H. rm_hif_eqn H.
+    - rewrite forallb_forall in Heqb. left. inversion H. subst. split; auto.
+      unfold memHandleFS. repeat intro. apply Heqb in H2. unfold neqMmapHandle in H2.
+      rewrite Bool.orb_true_iff, !Bool.negb_true_iff, !Nat.eqb_neq in H2.
+      destruct H2; apply H2; easy.
+    - right. destruct fs as [fs ?]. simpl in H. rewrite forallb_exists in Heqb.
+      destruct Heqb as [[[? ?] perm] [? ?]]. simpl in H2.
+      rewrite neqMmapHandle_false in H3. destruct H3. subst m n.
+      remember (deallocate_memory (mmap_memory fs) mid len (length l)) as succ.
+      exists perm, (mmap_memory fs), mid, len, succ. unfold memHandleFS in *.
+      simpl in *. split; auto. rm_hif_eqn H.
+      + simpl in H. inversion H. simpl. split; auto. right. subst postFS.
+        unfold logFS, openhandleFS, vmFS, dMapFS,
+        fCntFS, dCntFS, fMapFS, fsFS, layoutFS, memHandleFS, memoryFS in *. simpl.
+        intuition. pose proof (filter_perm' (neqMmapHandle mid len) (mmap_handles fs)).
+        rewrite (NoOverlap_NoNull_neq mid len perm) in H3; auto. simpl in H3. easy.
+      + inversion H. simpl. split; auto.
   Qed.
 
   (* page ids unique among all files *)
@@ -3619,9 +4210,9 @@ Section SGX_FS.
     - destruct H2 as [? [? [? [? ?]]]]. rewrite H5. auto.
     - destruct H2 as [? [? [? _]]]. rewrite H4. auto.
     - destruct H2 as [? [? [? _]]]. rewrite H4. auto.
-    - destruct H2 as [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]].
+    - destruct H2 as [? [? [? [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]]]]].
       unfold layoutFS, vmFS, fMapFS, dMapFS, fsFS, openhandleFS in *. hnf.
-      rewrite <- H5, <- H7, <- H8, <- H9, <- H10, H11.
+      rewrite <- H5, <- H7, <- H8, <- H9, <- H10, <- H11, <- H12, H13.
       destruct H1 as [? [? [? [? [? [? [? [? ?]]]]]]]]. split; intuition.
   Qed.
 
@@ -3635,10 +4226,10 @@ Section SGX_FS.
     - destruct H3 as [_ [_ [_ ?]]]. subst fs; auto.
     - destruct H3 as [_ [_ [_ ?]]]. subst fs; auto.
     - destruct H3 as [_ [_ [? _]]]. unfold fsFS. rewrite <- H3; auto.
-    - destruct H3 as [? [? [? [? [? [? [? [? [? [? [? _]]]]]]]]]]]. clear H H2. hnf.
-      destruct H1 as [? [? [? [? [? [? [? [? ?]]]]]]]].
+    - destruct H3 as [? [? [? [? [? [? [? [? [? [? [? [? [? _]]]]]]]]]]]]].
+      clear H H2. hnf. destruct H1 as [? [? [? [? [? [? [? [? ?]]]]]]]].
       unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS in *.
-      rewrite <- H6, <- H8, <- H9, <- H10, <- H11. intuition.
+      rewrite <- H6, <- H8, <- H9, <- H10, <- H11, <- H12, <- H13. intuition.
   Qed.
 
   Corollary fs_close_safty: forall arg result fs postFS,
@@ -3647,12 +4238,12 @@ Section SGX_FS.
   Proof.
     intros. pose proof (fs_close_ok _ _ _ _ H H0). destruct H1 as [?|[?|?]].
     - destruct H1 as [_ [? _]]. subst fs; assumption.
-    - destruct H1 as [? [? [? [? [? [? [? [? [? [? _]]]]]]]]]].
+    - destruct H1 as [? [? [? [? [? [? [? [? [? [? [? [? _]]]]]]]]]]]].
       destruct H as [? [? [? [? [? [? [? [? ?]]]]]]]]. hnf.
       unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS in *.
-      rewrite <- H4, <- H6, <- H7, <- H9, <- H10. intuition.
-      pose proof (Permutation_NoDup H3 H15). rewrite NoDup_cons_iff in H19.
-      destruct H19; assumption.
+      rewrite <- H4, <- H6, <- H7, <- H9, <- H10, <- H11, <- H12. intuition.
+      pose proof (Permutation_NoDup H3 H17). rewrite NoDup_cons_iff in H23.
+      destruct H23; assumption.
     - destruct H1 as [_ [_ [? _]]]. unfold fsFS. rewrite <- H1; assumption.
   Qed.
 
@@ -3678,10 +4269,10 @@ Section SGX_FS.
     - destruct H1 as [_ [? _]]. subst fs; assumption.
     - destruct H1 as [_ [_ [_ [? _]]]]. subst fs; assumption.
     - destruct H1 as [_ [_ [? _]]]. rewrite H1; assumption.
-    - destruct H1 as [? [? [? [? [? [? [? [? [? _]]]]]]]]].
+    - destruct H1 as [? [? [? [? [? [? [? [? [? [? [? _]]]]]]]]]]].
       destruct H as [? [? [? [? [? [? [? [? ?]]]]]]]]. hnf.
       unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS in *.
-      rewrite <- H3, <- H5, <- H6, <- H7, <- H8, H9. intuition.
+      rewrite <- H3, <- H5, <- H6, <- H7, <- H8, <- H9, <- H10, H11. intuition.
   Qed.
 
   Corollary fs_create_safty: forall arg result fs postFS,
@@ -3746,26 +4337,26 @@ Section SGX_FS.
     destruct H1 as [? | [? | [? | ?]]].
     - destruct H1 as [_ [_ [_ [_ ?]]]]; subst fs; assumption.
     - destruct H1 as [_ [? _]]. rewrite <- H1; assumption.
-    - destruct H1 as [? [? [? [? [? [? [? _]]]]]]].
+    - destruct H1 as [? [? [? [? [? [? [? [? [? _]]]]]]]]].
       destruct H as [? [? [? [? [? [? [? [? ?]]]]]]]]. hnf.
       unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS, fCntFS, dCntFS in *.
-      rewrite <- H2, <- H3, <- H5, <- H6, <- H7. intuition.
+      rewrite <- H2, <- H3, <- H5, <- H6, <- H7, <- H8, <- H9. intuition.
       apply preserve_dname_NoDupNameTree with (d_map (fst fs)). 2: assumption. intros.
       destruct H1 as [dId' [_ [_ [? ?]]]]. destruct (Nat.eq_dec dId dId').
       + subst dId'. intuition.
-      + rewrite H16; auto.
-    - destruct H1 as [? [? [? [? [? [? [? [? _]]]]]]]].
+      + rewrite H20; auto.
+    - destruct H1 as [? [? [? [? [? [? [? [? [_ [? [? _]]]]]]]]]]].
       destruct H as [? [? [? [? [? [? [? [? ?]]]]]]]]. hnf.
       unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS, fCntFS, dCntFS in *.
       destruct H1 as [fId' [? [? [? [? [? ?]]]]]].
       assert (forall id, pageIdsF (f_map (fst postFS) id) =
                          pageIdsF (f_map (fst fs) id)) by
-          (intros; destruct (Nat.eq_dec id fId'); [subst id | rewrite H21]; auto).
-      rewrite <- H3, <- H4, <- H6, <- H7, <- H8. intuition.
+          (intros; destruct (Nat.eq_dec id fId'); [subst id | rewrite H23]; auto).
+      rewrite <- H3, <- H4, <- H6, <- H7, <- H8, <- H9, <- H10. intuition.
       + apply preserve_fname_NoDupNameTree with (f_map (fst fs)). 2: assumption.
-        intros. destruct (Nat.eq_dec fId fId'); [subst fId | rewrite H21]; auto.
-      + rewrite H22 in H24, H25. eapply H15; eauto.
-      + rewrite H22 in H23. eapply H16; eauto.
+        intros. destruct (Nat.eq_dec fId fId'); [subst fId | rewrite H23]; auto.
+      + rewrite H24 in H30, H29. eapply H17; eauto.
+      + rewrite H24 in H27. eapply H25; eauto.
   Qed.
 
   Corollary fs_readdir_safty: forall arg result fs postFS,
@@ -3801,25 +4392,112 @@ Section SGX_FS.
     - destruct H1 as [_ [? _]]; subst fs; assumption.
     - destruct H1 as [_ [? _]]; subst fs; assumption.
     - destruct H1 as [_ [_ [? _]]]. rewrite <- H1; assumption.
-    - destruct H1 as [? [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]]].
+    - destruct H1 as [? [? [? [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]]]]].
       destruct H as [? [? [? [? [? [? [? [? ?]]]]]]]]. hnf.
       unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS, fCntFS, dCntFS in *.
-      rewrite <- H3, <- H4, <- H6, <- H7, <- H8. intuition.
+      rewrite <- H3, <- H4, <- H6, <- H7, <- H8, <- H9, <- H10. intuition.
       + apply preserve_fname_NoDupNameTree with (f_map (fst fs)); auto. intro id'.
-        destruct (Nat.eq_dec id' fId); [subst id' | rewrite H12]; intuition.
+        destruct (Nat.eq_dec id' fId); [subst id' | rewrite H24]; intuition.
       + destruct (Nat.eq_dec fId1 fId), (Nat.eq_dec fId2 fId).
-        * rewrite <- e in e0. apply H22. intuition.
-        * subst fId. clear n. revert H26. apply (H19 fId1 fId2); auto.
-          -- destruct H23 as [l ?]. rewrite H23, in_app_iff. left; auto.
-          -- rewrite <- H12; auto.
-        * subst fId. clear n. revert H26. apply (H19 fId1 fId2); auto.
-          -- rewrite <- H12; auto.
-          -- destruct H23 as [l ?]. rewrite H23, in_app_iff. left; auto.
-        * revert H26. apply (H19 fId1 fId2); auto; rewrite <- H12; auto.
+        * rewrite <- e in e0. apply H26. intuition.
+        * subst fId. clear n. revert H31. apply (H21 fId1 fId2); auto.
+          -- destruct H27 as [l ?]. rewrite H27, in_app_iff. left; auto.
+          -- rewrite <- H24; auto.
+        * subst fId. clear n. revert H31. apply (H21 fId1 fId2); auto.
+          -- rewrite <- H24; auto.
+          -- destruct H27 as [l ?]. rewrite H27, in_app_iff. left; auto.
+        * revert H31. apply (H21 fId1 fId2); auto; rewrite <- H24; auto.
       + destruct (Nat.eq_dec fId0 fId).
-        * subst fId0. destruct H23 as [l ?]. apply (H20 fId pgId).
-          rewrite H23, in_app_iff. left; auto.
-        * apply (H20 fId0 pgId). rewrite <- H12; auto.
+        * subst fId0. destruct H27 as [l ?]. apply (H23 fId pgId).
+          rewrite H27, in_app_iff. left; auto.
+        * apply (H23 fId0 pgId). rewrite <- H24; auto.
+  Qed.
+
+  Corollary mmap_safty: forall len perm flag fs result postFS,
+      good_file_system (fsFS fs) -> (result, postFS) = mmap len perm flag fs ->
+      good_file_system (fsFS postFS).
+  Proof.
+    intros. destruct result as [mid err]. pose proof H.
+    destruct H as [? [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]]].
+    pose proof (mmap_ok _ _ _ _ _ _ _ H0 H12).
+    destruct H13 as [? | ?]. 1: destruct H13 as [_ [? _]]; subst fs; easy.
+    destruct H13 as [? [p1 [p2 [addrs [? [? | ?]]]]]].
+    2: destruct H15 as [_ ?]; rewrite H15; easy. hnf.
+    destruct H15 as [? [? [? [? [? [? [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]]]]]]]].
+    unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS, fCntFS,
+    dCntFS, memHandleFS in *.
+    rewrite <- H21, <- H22, <- H24, <- H25, <- H26, <- H27, H28. intuition.
+    - constructor; auto.
+    - apply H33 in H31. destruct H31; auto. rewrite H31. apply repeat_length.
+    - unfold NoNull in *. rewrite Forall_forall in *. intros. simpl in H31.
+      destruct H31; auto. subst x. red. rewrite pad_size_neq_O. rewrite <- H17. easy.
+  Qed.
+
+  Close Scope string_scope.
+
+  Lemma Disjoint_comm: forall a b, Disjoint a b <-> Disjoint b a.
+  Proof.
+    intros. destruct a as [[s1 l1] p1]. destruct b as [[s2 l2] p2]. simpl. intuition.
+  Qed.
+
+  Lemma NoOverlap_double_cons: forall l a1 a2,
+      NoOverlap (a1 :: a2 :: l) -> NoOverlap (a2 :: a1 :: l).
+  Proof.
+    intros. inversion H. subst. inversion H3. subst. constructor.
+    - intros. simpl in H0. destruct H0. 2: apply H4; easy. subst y.
+      rewrite Disjoint_comm. apply H2. left; easy.
+    - constructor; auto. intros. apply H2. right; easy.
+  Qed.
+
+  Lemma NoOverlap_double_cons_iff: forall l a1 a2,
+      NoOverlap (a1 :: a2 :: l) <-> NoOverlap (a2 :: a1 :: l).
+  Proof. intros; split; intros; apply NoOverlap_double_cons; easy. Qed.
+
+  Lemma NoOverlap_cons_app: forall l1 l2 a,
+      NoOverlap (a :: l1 ++ l2) <-> NoOverlap (l1 ++ a :: l2).
+  Proof.
+    induction l1; intros; simpl. 1: easy. rewrite NoOverlap_double_cons_iff.
+    split; intros; inversion H; subst; constructor; intros.
+    - apply H2. rewrite in_app_iff in H0. simpl in *. rewrite in_app_iff. intuition.
+    - rewrite <- IHl1. easy.
+    - apply H2. rewrite in_app_iff. simpl in *. rewrite in_app_iff in H0. intuition.
+    - rewrite IHl1. easy.
+  Qed.
+
+  Lemma NoOverlap_perm: forall l1 l2,
+      Permutation l1 l2 -> NoOverlap l1 -> NoOverlap l2.
+  Proof.
+    induction l1. intros.
+    - destruct l2. 1: constructor. apply Permutation_length in H. simpl in H. omega.
+    - intros. assert (In a l2) by (apply (Permutation_in _ H); left; easy).
+      apply in_split in H1. destruct H1 as [li1 [li2 ?]]. subst l2.
+      rewrite <- NoOverlap_cons_app. apply Permutation_cons_app_inv in H. constructor.
+      + intros. inversion H0. subst. apply H4. symmetry in H.
+        apply (Permutation_in _ H). easy.
+      + apply IHl1; auto. inversion H0. auto.
+  Qed.
+
+  Lemma NoNull_perm: forall l1 l2, Permutation l1 l2 -> NoNull l1 -> NoNull l2.
+  Proof.
+    intros. unfold NoNull in *. rewrite Forall_forall in *. intros. apply H0.
+    symmetry in H. eapply Permutation_in; eauto.
+  Qed.
+
+  Corollary munmap_safty: forall mid len err fs postFS,
+      good_file_system (fsFS fs) -> (err, postFS) = munmap mid len fs ->
+      good_file_system (fsFS postFS).
+  Proof.
+    intros. pose proof H.
+    destruct H as [? [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]]].
+    pose proof (munmap_ok _ _ _ _ _ H0 H10 H12).
+    destruct H13 as [[_ [_ ?]] | ?]. 1: subst; easy. hnf.
+    destruct H13 as [perm [p1 [p2 [p3 [succ [? [? [[_ [_ ?]]| ?]]]]]]]].
+    1: rewrite H15; easy. destruct H15 as [? [? [? [? [? [? [? [? [? [? ?]]]]]]]]]].
+    unfold fsFS, layoutFS, vmFS, fMapFS, dMapFS, openhandleFS, fCntFS,
+    dCntFS, memHandleFS, memoryFS in *. symmetry in H25.
+    rewrite <- H17, <- H18, <- H20, <- H21, <- H22, <- H23, H24. intuition.
+    - apply NoOverlap_perm in H25; auto. inversion H25. easy.
+    - apply NoNull_perm in H25; auto. apply NoNull_cons_inv in H25. easy.
   Qed.
 
   Definition fs_functions:
@@ -3875,22 +4553,22 @@ Section SGX_FS.
   Lemma good_file_system_mkfs: forall name, good_file_system (fsFS (mkfs name)).
   Proof.
     intros. unfold mkfs. hnf. simpl.
-    split; [|split; [|split; [|split; [|split; [|split; [|split]]]]]]; intros.
+    split; [|split; [|split; [|split; [|split; [|split; [|split;[|split;[|split;[|split;[|split]]]]]]]]]]; intros; try easy.
     - constructor; simpl. 1: rewrite Forall_forall; intros; inversion H. constructor.
     - constructor; [intro S; inversion S | constructor].
     - constructor.
     - intros. destruct H; intuition.
-    - intuition.
     - constructor.
     - hnf. exists O, []. reflexivity.
-    - intros; intuition.
+    - constructor.
+    - red. easy.
   Qed.
 
   Corollary composition_mkfs_safty: forall l name,
       (forall v, In v l -> In (existT _ (projT1 v) (fst (projT2 v))) fs_functions) ->
       good_file_system (fsFS (fs_compose l (mkfs name))).
   Proof. intros. apply composition_safty; auto. apply good_file_system_mkfs. Qed.
-  
+
   Parameter fs_rename : Path -> FData -> Path -> FData -> ErrCode.
   Parameter fs_flush : Fid -> ErrCode.
 
