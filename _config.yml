@@ -4,7 +4,7 @@ description: A POSIX Filesystem for Enclaves with a Mechanized Safety Proof
 show_downloads: false
 google_analytics: UA-44220999-3
 url: "https://shwetasshinde24.github.io/BesFS"
-title_image: "https://github.com/shwetasshinde24/BesFS/blob/gh-pages/besfs_card.png"
+title_image: "https://people.eecs.berkeley.edu/~shwetas/img/besfs_card.png"
 github_repository: https://github.com/shwetasshinde24/BesFS
 
 # Social usernames/URLs
