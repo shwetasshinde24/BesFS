@@ -1,4 +1,0 @@
-State.vo State.glob State.v.beautified: State.v
-State.vio: State.v
-SGX_FS.vo SGX_FS.glob SGX_FS.v.beautified: SGX_FS.v State.vo
-SGX_FS.vio: SGX_FS.v State.vio
