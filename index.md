@@ -27,7 +27,13 @@ Download the code and follow the installation instructions [here](https://github
 Alternatively, you can use [Proof General](https://proofgeneral.github.io/) IDE with Emacs to step through the proof.
 
 -----
-## Build the Coq files
+
+## Get the code 
+```
+git clone git@github.com:shwetasshinde24/BesFS.git
+```
+
+## Build BesFS
 ```
 make depend
 
