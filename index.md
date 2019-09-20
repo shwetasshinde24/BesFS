@@ -40,7 +40,7 @@ make all
 * **"BesFS: A POSIX Filesystem for Enclaves with a Mechanized Safety Proof"**, 
 _Shweta Shinde*, Shengyi Wang*, Pinghai Yuan, Aquinas Hobor, Abhik Roychoudhury, Prateek Saxena_, 
 arXiv preprint arXiv:1807.00477
-[Paper](https://arxiv.org/abs/1807.00477)
+[Paper](https://people.eecs.berkeley.edu/~shwetas/publications/besfs_usenix20.pdf)
 
 -----
 ## BesFS Team 
