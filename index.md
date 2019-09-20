@@ -1,6 +1,4 @@
-# BesFS: A POSIX Filesystem for Enclaves with a Mechanized Safety Proof
-
-## BesFS Overview
+## BesFS
 
 New trusted computing primitives such as Intel SGX have shown the
 feasibility of running user-level applications in enclaves on a
